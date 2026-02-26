@@ -59,6 +59,8 @@ FIBER_STL = Path("../FiberOptic/fiber_temp_2000x1x1.stl")
 CAP_STL   = Path("../FiberOptic/end_cap_5x5.stl")
 
 FIBER_CLEARANCE = 30.0  # mm
+FIBER_EDGE   = 1.0    # mm 
+CAP_OFFSET   = 0.22   # mm from fiber end
 
 def stl_to_hp_mesh(path, scale):
     tm = trimesh.load(path, force="mesh")
@@ -189,15 +191,31 @@ for i in range(n_instances):
 
 N_FIBERS = 100
 
-for k in range(N_FIBERS):
-    phi = 2.0 * np.pi * k / N_FIBERS   # uniform around circle
+z_fiber_min = fiber_mesh.vertices[:, 2].min()
+z_fiber_max = fiber_mesh.vertices[:, 2].max()
 
+z_cap_top    = z_fiber_max + CAP_OFFSET
+z_cap_bottom = z_fiber_min - CAP_OFFSET
+
+cap_extent_x = np.ptp(cap_mesh.vertices[:, 0])
+cap_extent_y = np.ptp(cap_mesh.vertices[:, 1])
+
+cap_scale_x = FIBER_EDGE / cap_extent_x
+cap_scale_y = FIBER_EDGE / cap_extent_y
+
+cap_scale = Transform.Scale(cap_scale_x, cap_scale_y, 1.0)
+
+for k in range(N_FIBERS):
+    phi = 2.0 * np.pi * k / N_FIBERS
     x = R_fiber * np.cos(phi)
     y = R_fiber * np.sin(phi)
 
+    # -------------------------
+    # Fiber body
+    # -------------------------
     M_fiber = np.zeros((3, 4), dtype=np.float32)
     M_fiber[:3, :3] = np.eye(3)
-    M_fiber[:3,  3] = np.array([x, y, 0.0])
+    M_fiber[:3,  3] = [x, y, 0.0]
 
     instances.append(
         meshStore.createInstance(
@@ -207,6 +225,38 @@ for k in range(N_FIBERS):
         )
     )
 
+    # -------------------------
+    # TOP detector
+    # -------------------------
+    M_top = np.zeros((3, 4), dtype=np.float32)
+    M_top[:3, :3] = np.eye(3)
+    M_top[:3,  3] = [x, y, z_cap_top]
+
+    instances.append(
+        meshStore.createInstance(
+            "cap",
+            "detector",
+            cap_scale @ Transform(M_top),
+            detectorId=2*k,          # even IDs
+        )
+    )
+
+    # -------------------------
+    # BOTTOM detector
+    # -------------------------
+    M_bot = np.zeros((3, 4), dtype=np.float32)
+    M_bot[:3, :3] = np.eye(3)
+    M_bot[:3,  3] = [x, y, z_cap_bottom]
+
+    instances.append(
+        meshStore.createInstance(
+            "cap",
+            "detector",
+            cap_scale @ Transform(M_bot),
+            detectorId=2*k + 1,      # odd IDs
+        )
+    )
+    
 scene = Scene(
     instances,
     materialStore,
@@ -229,7 +279,7 @@ source  = SphericalLightSource(timeRange=(0.0, 0.0))
 
 response = IntegratingHitResponse(
     UniformValueResponse(),
-    detectorCount=1,
+    detectorCount=2*N_FIBERS,
 )
 
 batch_size = 256 * 1024
@@ -281,6 +331,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 from mpl_toolkits.mplot3d import Axes3D  # noqa
 from matplotlib.patches import Patch
+import matplotlib.cm as cm
+
+detector_cmap = cm.get_cmap("hsv", 2 * N_FIBERS)
 
 # ------------------------------------------------------------
 # Colors & transparency
@@ -301,7 +354,7 @@ MESH_ALPHA = {
     4: 0.30,
 }
 
-fig = plt.figure(figsize=(12, 10))
+fig = plt.figure(figsize=(14, 12), dpi=150)
 ax = fig.add_subplot(111, projection="3d")
 
 all_points = []
@@ -322,50 +375,92 @@ for i in range(n_instances):
     all_points.append(Vt)
 
     ax.plot_trisurf(
-        Vt[:, 0], Vt[:, 1], Vt[:, 2],
-        triangles=F,
-        color=MESH_COLORS[mid],
-        alpha=MESH_ALPHA[mid],
-        linewidth=0,
-        edgecolor="none",
-    )
+    Vt[:, 0], Vt[:, 1], Vt[:, 2],
+    triangles=F,
+    color=MESH_COLORS[mid],
+    alpha=MESH_ALPHA[mid],
+    linewidth=0,
+    edgecolor="none",
+    antialiased=True,
+    shade=True,          # ⭐ this is the key
+)
+
 
 # ------------------------------------------------------------
-# Fiber centerlines (Option A)
+# Fiber centerlines (FAST & SAFE)
 # ------------------------------------------------------------
-colors = ["lime", "red", "blue", "orange"]
-
 zmin = fiber_mesh.vertices[:, 2].min()
 zmax = fiber_mesh.vertices[:, 2].max()
-z = np.linspace(zmin, zmax, 500)
 
 
-N_FIBERS = 100
-
-R_plot = R_fiber   # important: use same radius as scene
+z = np.linspace(zmin, zmax, 200)
 
 for k in range(N_FIBERS):
     phi = 2.0 * np.pi * k / N_FIBERS
-
-    x = R_plot * np.cos(phi)
-    y = R_plot * np.sin(phi)
+    x = R_fiber * np.cos(phi)
+    y = R_fiber * np.sin(phi)
 
     ax.plot(
         np.full_like(z, x),
         np.full_like(z, y),
         z,
-        color="lime",
-        linewidth=2,
-        alpha=0.8,
+        color="#39ff14",
+        linewidth=1.5,
+        alpha=0.9,
     )
 
-    all_points.append(
-        np.column_stack([
-            np.full_like(z, x),
-            np.full_like(z, y),
-            z
-        ])
+# ------------------------------------------------------------
+# Top detector caps
+# ------------------------------------------------------------
+for k in range(N_FIBERS):
+    phi = 2.0 * np.pi * k / N_FIBERS
+    x = R_fiber * np.cos(phi)
+    y = R_fiber * np.sin(phi)
+
+    Vt = (cap_mesh.vertices * np.array([
+              cap_scale_x,
+              cap_scale_y,
+              1.0
+          ])) + np.array([x, y, z_cap_top])
+
+    ax.plot_trisurf(
+        Vt[:, 0], Vt[:, 1], Vt[:, 2],
+        triangles=cap_mesh.indices,
+        color=detector_cmap(2*k),   # even IDs = top
+        alpha=0.95,
+        linewidth=0,
+        antialiased=True,
+        shade=True,
     )
+
+    all_points.append(Vt)
+
+# ------------------------------------------------------------
+# Bottom detector caps
+# ------------------------------------------------------------
+for k in range(N_FIBERS):
+    phi = 2.0 * np.pi * k / N_FIBERS
+    x = R_fiber * np.cos(phi)
+    y = R_fiber * np.sin(phi)
+
+    Vt = (cap_mesh.vertices * np.array([
+              cap_scale_x,
+              cap_scale_y,
+              1.0
+          ])) + np.array([x, y, z_cap_bottom])
+
+    ax.plot_trisurf(
+        Vt[:, 0], Vt[:, 1], Vt[:, 2],
+        triangles=cap_mesh.indices,
+        color=detector_cmap(2*k + 1),
+        alpha=0.95,
+        linewidth=0,
+        antialiased=True,
+        shade=True,
+    )
+
+    all_points.append(Vt)
+
 
 # ------------------------------------------------------------
 # Equal aspect ratio
@@ -399,7 +494,6 @@ ax.legend(
 # ------------------------------------------------------------
 ax.set_title("SCARF Geometry + Fiber Centerlines")
 ax.set_axis_off()
-ax.view_init(elev=20, azim=35)
 
 # ------------------------------------------------------------
 # FORCE Z VISIBILITY (DEBUG – DO THIS)
