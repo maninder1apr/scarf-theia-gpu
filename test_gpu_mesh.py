@@ -23,8 +23,9 @@ hp.enableRaytracing()
 print("✅ GPU ray tracing enabled")
 
 # ============================================================
-# 1. PATHS
+# 1. PATHS + LOAD SCARF MESHES
 # ============================================================
+
 BASE = Path("/home/users01/msingh/TheiaSimulations/MeshTest/meshes")
 PLACEMENTS_FILE = BASE / "placements.npz"
 
@@ -36,20 +37,6 @@ MESH_TABLE = {
     4: BASE / "pen/pen_icpc_pc_s.npz",
 }
 
-# ============================================================
-# 2. LOAD PLACEMENTS
-# ============================================================
-p = np.load(PLACEMENTS_FILE)
-translations = p["translations"].astype(np.float32)
-rotations    = p["rotations"].astype(np.float32)
-mesh_ids     = p["mesh_ids"].astype(int)
-
-n_instances = len(mesh_ids)
-print(f"Loaded {n_instances} SCARF placements")
-
-# ============================================================
-# 3. LOAD SCARF MESHES (hp.Mesh ONLY)
-# ============================================================
 mesh_cache = {}
 
 for mid, path in MESH_TABLE.items():
@@ -64,39 +51,120 @@ for mid, path in MESH_TABLE.items():
 print(f"Loaded {len(mesh_cache)} hp.Mesh objects")
 
 # ============================================================
-# 4. MATERIALS (KNOWN-GOOD API)
+# 2. FIBER GEOMETRY
+# ============================================================
+import trimesh
+
+FIBER_STL = Path("../FiberOptic/fiber_temp_2000x1x1.stl")
+CAP_STL   = Path("../FiberOptic/end_cap_5x5.stl")
+
+FIBER_CLEARANCE = 30.0  # mm
+
+def stl_to_hp_mesh(path, scale):
+    tm = trimesh.load(path, force="mesh")
+    V = np.ascontiguousarray(tm.vertices * scale, dtype=np.float32)
+    F = np.ascontiguousarray(tm.faces, dtype=np.int32)
+
+    mesh = hp.Mesh()
+    mesh.vertices = V
+    mesh.indices  = F
+    return mesh
+
+fiber_mesh = stl_to_hp_mesh(FIBER_STL, 100)
+cap_mesh   = stl_to_hp_mesh(CAP_STL, 100)
+
+# Rotate fiber so its long axis is Z
+R_x_to_z = np.array([
+    [0, 0, 1],
+    [0, 1, 0],
+    [-1, 0, 0],
+], dtype=np.float32)
+
+fiber_mesh.vertices = fiber_mesh.vertices @ R_x_to_z.T
+cap_mesh.vertices   = cap_mesh.vertices   @ R_x_to_z.T
+
+# ============================================================
+# 3. LOAD PLACEMENTS
+# ============================================================
+p = np.load(PLACEMENTS_FILE)
+translations = p["translations"].astype(np.float32)
+rotations    = p["rotations"].astype(np.float32)
+mesh_ids     = p["mesh_ids"].astype(int)
+
+n_instances = len(mesh_ids)
+print(f"Loaded {n_instances} SCARF placements")
+
+# ============================================================
+# 4. COMPUTE HPGe + PEN RADIAL ENVELOPE
+# ============================================================
+r_env = 0.0
+
+for i in range(n_instances):
+    mid = int(mesh_ids[i])
+
+    if mid not in (1, 2, 3, 4):
+        continue
+
+    V = mesh_cache[mid].vertices
+    Rm = rotations[i].reshape(3, 3)
+    Tm = translations[i]
+
+    Vt = (V @ Rm.T) + Tm
+    r = np.sqrt(Vt[:, 0]**2 + Vt[:, 1]**2)
+
+    r_env = max(r_env, r.max())
+
+print(f"✅ HPGe + PEN envelope radius = {r_env:.2f} mm")
+
+R_fiber = r_env + FIBER_CLEARANCE
+print(f"✅ Fiber placement radius R_fiber = {R_fiber:.2f} mm")
+
+# ============================================================
+# 5. MATERIALS
 # ============================================================
 from theia.material import DispersionFreeMedium, Material, MaterialStore
 
 lambda_range = (350.0, 550.0) * u.nm
 
 lar_medium = DispersionFreeMedium(n=1.23).createMedium(
-    name="lar", wavelengthRange=lambda_range
-)
-ge_medium = DispersionFreeMedium(n=4.0).createMedium(
-    name="ge", wavelengthRange=lambda_range
-)
-pen_medium = DispersionFreeMedium(n=1.65).createMedium(
-    name="pen", wavelengthRange=lambda_range
+    name="lar",
+    wavelengthRange=lambda_range
 )
 
+ge_medium = DispersionFreeMedium(n=4.0).createMedium(
+    name="ge",
+    wavelengthRange=lambda_range
+)
+
+pen_medium = DispersionFreeMedium(n=1.65).createMedium(
+    name="pen",
+    wavelengthRange=lambda_range
+)
+
+fiber_medium = DispersionFreeMedium(n=1.59).createMedium(
+    name="fiber",
+    wavelengthRange=lambda_range
+)
 materialStore = MaterialStore([
     Material("lar", lar_medium, None),
     Material("ge",  ge_medium,  lar_medium),
     Material("pen", pen_medium, lar_medium),
+    Material("fiber", fiber_medium, lar_medium),
     Material("detector", None, None, flags="*DB"),
 ])
 
 # ============================================================
-# 5. BUILD THEIA SCENE (hp.Mesh → MeshStore)
+# 6. BUILD SCENE
 # ============================================================
 from theia.scene import MeshStore, Scene, Transform
 
 meshStore = MeshStore({
-    "lar":  mesh_cache[0],
-    "ge":   mesh_cache[1],
-    "icpc": mesh_cache[2],
-    "pen":  mesh_cache[3],  # reuse for both PEN meshes
+    "lar":   mesh_cache[0],
+    "ge":    mesh_cache[1],
+    "icpc":  mesh_cache[2],
+    "pen":   mesh_cache[3],
+    "fiber": fiber_mesh,
+    "cap":   cap_mesh,
 })
 
 mesh_name = {0: "lar", 1: "ge", 2: "icpc", 3: "pen", 4: "pen"}
@@ -106,18 +174,36 @@ instances = []
 
 for i in range(n_instances):
     mid = mesh_ids[i]
-    R = rotations[i].reshape(3, 3)
-    T = translations[i]
 
     M = np.zeros((3, 4), dtype=np.float32)
-    M[:3, :3] = R
-    M[:3,  3] = T
+    M[:3, :3] = rotations[i].reshape(3, 3)
+    M[:3,  3] = translations[i]
 
     instances.append(
         meshStore.createInstance(
             mesh_name[mid],
             mat_name[mid],
             Transform(M),
+        )
+    )
+
+N_FIBERS = 100
+
+for k in range(N_FIBERS):
+    phi = 2.0 * np.pi * k / N_FIBERS   # uniform around circle
+
+    x = R_fiber * np.cos(phi)
+    y = R_fiber * np.sin(phi)
+
+    M_fiber = np.zeros((3, 4), dtype=np.float32)
+    M_fiber[:3, :3] = np.eye(3)
+    M_fiber[:3,  3] = np.array([x, y, 0.0])
+
+    instances.append(
+        meshStore.createInstance(
+            "fiber",
+            "fiber",
+            Transform(M_fiber),
         )
     )
 
@@ -128,9 +214,8 @@ scene = Scene(
 )
 
 print("✅ THEIA Scene created")
-
 # ============================================================
-# 6. SOURCE + TRACER
+# 7. SOURCE + TRACER
 # ============================================================
 from theia.random import PhiloxRNG
 from theia.light import ConstWavelengthSource, SphericalLightSource
@@ -148,7 +233,6 @@ response = IntegratingHitResponse(
 )
 
 batch_size = 256 * 1024
-max_path_length = 60000
 
 tracer = SceneForwardTracer(
     batch_size,
@@ -157,7 +241,7 @@ tracer = SceneForwardTracer(
     response,
     rng,
     scene,
-    maxPathLength=max_path_length,
+    maxPathLength=60000,
     scatterCoefficient=0.0,
     maxTime=float("inf"),
 )
@@ -166,7 +250,7 @@ rng.autoAdvance = tracer.nRNGSamples
 print("✅ THEIA tracer initialized")
 
 # ============================================================
-# 7. RUN
+# 8. RUN
 # ============================================================
 results = []
 
@@ -176,14 +260,9 @@ def process(ctx, batch, _):
 pipeline  = pl.Pipeline(tracer.collectStages())
 scheduler = pl.PipelineScheduler(pipeline, processFn=process)
 
-scheduler.schedule([
-    {"lightSource__position": (0.0, 0.0, 0.0)}
-])
+scheduler.schedule([{"lightSource__position": (0.0, 0.0, 0.0)}])
 scheduler.wait()
 
-# ============================================================
-# 8. RESULTS
-# ============================================================
 hits = np.array(results)
 
 print("===================================================")
@@ -192,56 +271,43 @@ print(f"Photons simulated : {batch_size:,}")
 print(f"Detected photons  : {hits.sum()}")
 print(f"Detection eff.    : {hits.sum() / batch_size:.6e}")
 print("===================================================")
-# ============================================================
-# 9. VISUALIZATION (GEOMETRY + DETECTORS)
-# ============================================================
-# ============================================================
-# 9. VISUALIZATION (SCARF GEOMETRY, HEADLESS, SAVE ONLY)
-# ============================================================
 
-import matplotlib
-matplotlib.use("Agg")  # REQUIRED on HPC / headless nodes
+
+# ============================================================
+# 9. INTERACTIVE VISUALIZATION (matplotlib3d)
+# ============================================================
 
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa
 import numpy as np
+from mpl_toolkits.mplot3d import Axes3D  # noqa
+from matplotlib.patches import Patch
 
 # ------------------------------------------------------------
-# Per-mesh color & transparency (by SCARF mesh_id)
+# Colors & transparency
 # ------------------------------------------------------------
-# mesh_id:
-#   0 = LAr
-#   1 = BEGe (HPGe)
-#   2 = ICPC (HPGe)
-#   3 = PEN (BEGe side)
-#   4 = PEN (ICPC side)
-
 MESH_COLORS = {
-    0: "#6fa8dc",   # Liquid Argon (blue)
-    1: "#cc0000",   # BEGe (red)
-    2: "#7a1fa2",   # ICPC (purple)
-    3: "#f6b26b",   # PEN (orange)
-    4: "#f6b26b",   # PEN (orange)
+    0: "#6fa8dc",
+    1: "#cc0000",
+    2: "#7a1fa2",
+    3: "#f6b26b",
+    4: "#f6b26b",
 }
 
 MESH_ALPHA = {
-    0: 0.12,  # LAr (very transparent)
-    1: 0.80,  # BEGe
-    2: 0.80,  # ICPC
-    3: 0.30,  # PEN
-    4: 0.30,  # PEN
+    0: 0.12,
+    1: 0.80,
+    2: 0.80,
+    3: 0.30,
+    4: 0.30,
 }
 
-# ------------------------------------------------------------
-# Create figure
-# ------------------------------------------------------------
 fig = plt.figure(figsize=(12, 10))
 ax = fig.add_subplot(111, projection="3d")
 
 all_points = []
 
 # ------------------------------------------------------------
-# Plot all SCARF instances
+# SCARF geometry
 # ------------------------------------------------------------
 for i in range(n_instances):
     mid = mesh_ids[i]
@@ -256,14 +322,49 @@ for i in range(n_instances):
     all_points.append(Vt)
 
     ax.plot_trisurf(
-        Vt[:, 0],
-        Vt[:, 1],
-        Vt[:, 2],
+        Vt[:, 0], Vt[:, 1], Vt[:, 2],
         triangles=F,
-        color=MESH_COLORS.get(mid, "gray"),
-        alpha=MESH_ALPHA.get(mid, 0.25),
+        color=MESH_COLORS[mid],
+        alpha=MESH_ALPHA[mid],
         linewidth=0,
         edgecolor="none",
+    )
+
+# ------------------------------------------------------------
+# Fiber centerlines (Option A)
+# ------------------------------------------------------------
+colors = ["lime", "red", "blue", "orange"]
+
+zmin = fiber_mesh.vertices[:, 2].min()
+zmax = fiber_mesh.vertices[:, 2].max()
+z = np.linspace(zmin, zmax, 500)
+
+
+N_FIBERS = 100
+
+R_plot = R_fiber   # important: use same radius as scene
+
+for k in range(N_FIBERS):
+    phi = 2.0 * np.pi * k / N_FIBERS
+
+    x = R_plot * np.cos(phi)
+    y = R_plot * np.sin(phi)
+
+    ax.plot(
+        np.full_like(z, x),
+        np.full_like(z, y),
+        z,
+        color="lime",
+        linewidth=2,
+        alpha=0.8,
+    )
+
+    all_points.append(
+        np.column_stack([
+            np.full_like(z, x),
+            np.full_like(z, y),
+            z
+        ])
     )
 
 # ------------------------------------------------------------
@@ -282,51 +383,47 @@ ax.set_zlim(center[2] - extent, center[2] + extent)
 ax.set_box_aspect([1, 1, 1])
 
 # ------------------------------------------------------------
-# Optional: mark optical source at origin
+# Legend & view
 # ------------------------------------------------------------
-ax.scatter(
-    [0.0], [0.0], [0.0],
-    c="black",
-    s=90,
-    marker="*",
-)
-
-# ------------------------------------------------------------
-# Legend (manual, reliable)
-# ------------------------------------------------------------
-from matplotlib.patches import Patch
-
-legend_handles = [
-    Patch(facecolor="#6fa8dc", edgecolor="k", label="Liquid Argon"),
-    Patch(facecolor="#f6b26b", edgecolor="k", label="PEN"),
-    Patch(facecolor="#cc0000", edgecolor="k", label="BEGe (HPGe)"),
-    Patch(facecolor="#7a1fa2", edgecolor="k", label="ICPC (HPGe)"),
-]
-
 ax.legend(
-    handles=legend_handles,
-    loc="upper left",
+    handles=[
+        Patch(facecolor="#6fa8dc", label="Liquid Argon"),
+        Patch(facecolor="#f6b26b", label="PEN"),
+        Patch(facecolor="#cc0000", label="BEGe (HPGe)"),
+        Patch(facecolor="#7a1fa2", label="ICPC (HPGe)"),
+    ],
     frameon=False,
 )
-
 # ------------------------------------------------------------
-# View & formatting
+# View, SAVE, then interact
 # ------------------------------------------------------------
-ax.set_title("SCARF Geometry + Optical Detectors")
+ax.set_title("SCARF Geometry + Fiber Centerlines")
 ax.set_axis_off()
 ax.view_init(elev=20, azim=35)
 
+# ------------------------------------------------------------
+# FORCE Z VISIBILITY (DEBUG – DO THIS)
+# ------------------------------------------------------------
+ax.view_init(elev=0, azim=90)   # look along X, see full Z
+
+# Tighten X/Y, emphasize Z
+ax.set_xlim(-R_fiber * 1.5, R_fiber * 1.5)
+ax.set_ylim(-R_fiber * 1.5, R_fiber * 1.5)
+ax.set_zlim(zmin, zmax)
+
 plt.tight_layout()
 
-# ------------------------------------------------------------
-# Save outputs
-# ------------------------------------------------------------
-plt.savefig("scarf_geometry.pdf")
+# ✅ SAVE FIRST (important!)
 plt.savefig("scarf_geometry.png", dpi=300)
-plt.close(fig)
+plt.savefig("scarf_geometry.pdf")
+print("✅ Saved scarf_geometry.png and scarf_geometry.pdf")
 
-print("Saved scarf_geometry.pdf and scarf_geometry.png")
+print("Fiber Z min:", zmin)
+print("Fiber Z max:", zmax)
+print("Fiber length:", zmax - zmin)
 
+# ✅ THEN SHOW INTERACTIVELY
+plt.show()
 # ------------------------------------------------------------
 # HARD EXIT (prevents matplotlib teardown segfault on HPC)
 # ------------------------------------------------------------
