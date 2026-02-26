@@ -59,7 +59,7 @@ FIBER_STL = Path("../FiberOptic/fiber_temp_2000x1x1.stl")
 CAP_STL   = Path("../FiberOptic/end_cap_5x5.stl")
 
 FIBER_CLEARANCE = 30.0  # mm
-FIBER_EDGE   = 1.0    # mm 
+FIBER_EDGE   = 1.0    # mm
 CAP_OFFSET   = 0.22   # mm from fiber end
 
 def stl_to_hp_mesh(path, scale):
@@ -256,7 +256,7 @@ for k in range(N_FIBERS):
             detectorId=2*k + 1,      # odd IDs
         )
     )
-    
+
 scene = Scene(
     instances,
     materialStore,
